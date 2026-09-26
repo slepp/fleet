@@ -9,16 +9,19 @@ usage() {
 Usage:
   fleet --list
   fleet --show SET
-  fleet SET [--serial] [--pace 30s] [--tui | --gui | --detach] [--panes N] 'remote shell command'
+  fleet SET [--serial] [--pace DURATION] [--tui | --gui | --detach]
+            [--panes N] [--linger DURATION|forever] 'remote shell command'
 
 Host sets are files named sets/SET.hosts, with one SSH host or alias per line.
 Blank lines and lines beginning with # are ignored. SSH options belong in
 ~/.ssh/config. The command is passed to each host's shell as written.
+Completed visual panes close after 10 seconds unless --linger changes it.
 
 Examples:
   fleet k3s -- 'sudo apt-get update && sudo apt-get dist-upgrade -y && sync'
   fleet k3s --serial --pace 30s 'sudo apt-get dist-upgrade -y'
   fleet k3s --serial --tui --pace 30s 'uptime'
+  fleet k3s --linger forever -- 'uptime'
   fleet --gui routers -- 'show version'
   fleet --panes 2 --detach proxmox -- 'uptime'
 EOF
@@ -29,9 +32,97 @@ die() {
     exit 2
 }
 
+duration_seconds() {
+    local duration=$1 option=$2 seconds
+    [[ $duration =~ ^([0-9]{1,5})([smh]?)$ ]] || \
+        die "$option must be seconds, minutes or hours (for example 30s)"
+    seconds=$((10#${BASH_REMATCH[1]}))
+    case ${BASH_REMATCH[2]} in
+        m) seconds=$((seconds * 60)) ;;
+        h) seconds=$((seconds * 3600)) ;;
+    esac
+    (( seconds <= 86400 )) || die "$option must be no more than 24 hours"
+    printf '%s\n' "$seconds"
+}
+
 quote() {
     local value=$1
     printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+shell_quote_args() {
+    local argument
+    for argument in "$@"; do
+        quote "$argument"
+        printf ' '
+    done
+}
+
+pack_session() {
+    local session=$1 max_panes=$2 destination source_window source_panes
+    local source_pane count moved zoomed
+    local -a windows=()
+    local destination_index source_index
+    while :; do
+        mapfile -t windows < <(tmux list-windows -t "$session" -F '#{window_id}' 2>/dev/null)
+        (( ${#windows[@]} > 1 )) || return 0
+        moved=false
+        for ((destination_index = 0; destination_index < ${#windows[@]} - 1; destination_index++)); do
+            destination=${windows[destination_index]}
+            count=$(tmux list-panes -t "$destination" -F '#{pane_id}' 2>/dev/null | wc -l) || continue
+            (( count < max_panes )) || continue
+            zoomed=$(tmux display-message -p -t "$destination" '#{window_zoomed_flag}' 2>/dev/null) || continue
+            [[ $zoomed == 0 ]] || continue
+            for ((source_index = destination_index + 1; source_index < ${#windows[@]}; source_index++)); do
+                source_window=${windows[source_index]}
+                source_panes=$(tmux list-panes -t "$source_window" -f '#{?pane_dead,0,1}' -F '#{pane_id}' 2>/dev/null) || continue
+                [[ -n $source_panes ]] || continue
+                source_pane=${source_panes%%$'\n'*}
+                if tmux join-pane -d -s "$source_pane" -t "$destination" 2>/dev/null; then
+                    tmux select-layout -t "$destination" tiled >/dev/null 2>&1 || true
+                    tmux select-layout -t "$source_window" tiled >/dev/null 2>&1 || true
+                    moved=true
+                    break 2
+                fi
+            done
+        done
+        [[ $moved == true ]] || return 0
+    done
+}
+
+retire_pane() {
+    local pane=$1 max_panes=$2 details dead session window lock attempt ready
+    while :; do
+        ready=$(tmux display-message -p -t "$pane" '#{@fleet_ready}' 2>/dev/null) || return 0
+        [[ $ready == 1 ]] && break
+        sleep 0.2
+    done
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        details=$(tmux display-message -p -t "$pane" '#{pane_dead} #{session_id} #{window_id}' 2>/dev/null) || return 0
+        read -r dead session window <<< "$details"
+        [[ $dead == 1 ]] && break
+        sleep 0.1
+    done
+    [[ $dead == 1 ]] || return 0
+    lock="fleet-pack-${session#\$}"
+    tmux wait-for -L "$lock" || return 0
+    retire_lock=$lock
+    trap 'tmux wait-for -U "$retire_lock" >/dev/null 2>&1 || true' EXIT
+    details=$(tmux display-message -p -t "$pane" '#{pane_dead} #{session_id} #{window_id}' 2>/dev/null) || return 0
+    read -r dead session window <<< "$details"
+    [[ $dead == 1 ]] || return 0
+    tmux kill-pane -t "$pane" 2>/dev/null || return 0
+    tmux select-layout -t "$window" tiled >/dev/null 2>&1 || true
+    pack_session "$session" "$max_panes"
+}
+
+schedule_retirement() {
+    local timer_command
+    [[ $linger_seconds != forever && -n ${TMUX_PANE:-} ]] || return 0
+    timer_command=$(shell_quote_args "$ROOT/fleet" --retire-pane \
+        "$TMUX_PANE" "$linger_seconds" "$max_panes")
+    tmux run-shell -b "$timer_command" || \
+        printf 'fleet: could not schedule pane cleanup for %s\n' "$TMUX_PANE" >&2
 }
 
 run_host() {
@@ -47,9 +138,18 @@ run_host() {
     return "$status"
 }
 
+if [[ ${1:-} == --retire-pane ]]; then
+    (( $# == 4 )) || die 'internal invocation error'
+    sleep "$3"
+    retire_pane "$2" "$4"
+    exit 0
+fi
+
 if [[ ${1:-} == --run-host ]]; then
-    (( $# == 7 )) || die 'internal invocation error'
+    (( $# == 9 )) || die 'internal invocation error'
     host=$2 remote_command=$3 queue_dir=$4 index=$5 count=$6 pace_seconds=$7
+    linger_seconds=$8 max_panes=$9
+    trap schedule_retirement EXIT
     status=0
     if [[ -n $queue_dir && $index -gt 0 ]]; then
         printf '=== %s: queued ===\n' "$host"
@@ -85,6 +185,8 @@ mode=attach
 serial=false
 pace=0
 pace_given=false
+linger=10s
+linger_given=false
 set_name=
 remote_command=
 if (( $# == 0 )); then
@@ -117,6 +219,12 @@ while (( $# > 0 )); do
             (( $# >= 2 )) || die '--pace needs a duration'
             pace=$2
             pace_given=true
+            shift 2
+            ;;
+        --linger)
+            (( $# >= 2 )) || die '--linger needs a duration or forever'
+            linger=$2
+            linger_given=true
             shift 2
             ;;
         --panes)
@@ -196,16 +304,16 @@ fi
 
 [[ -n $remote_command ]] || die 'remote command is empty'
 [[ $serial == true || $pace_given == false ]] || die '--pace requires --serial'
-[[ $pace =~ ^([0-9]{1,5})([smh]?)$ ]] || die '--pace must be seconds, minutes or hours (for example 30s)'
-pace_seconds=$((10#${BASH_REMATCH[1]}))
-case ${BASH_REMATCH[2]} in
-    m) pace_seconds=$((pace_seconds * 60)) ;;
-    h) pace_seconds=$((pace_seconds * 3600)) ;;
-esac
-(( pace_seconds <= 86400 )) || die '--pace must be no more than 24 hours'
+pace_seconds=$(duration_seconds "$pace" '--pace')
+if [[ $linger == forever ]]; then
+    linger_seconds=forever
+else
+    linger_seconds=$(duration_seconds "$linger" '--linger')
+fi
 command -v ssh >/dev/null || die 'ssh is required'
 if [[ $serial == true && $mode == attach ]]; then
     [[ $panes_given == false ]] || die '--panes requires --tui, --gui or --detach with --serial'
+    [[ $linger_given == false ]] || die '--linger requires --tui, --gui or --detach with --serial'
     for ((i = 0; i < ${#hosts[@]}; i++)); do
         if (( i > 0 && pace_seconds > 0 )); then
             printf '\nWaiting %ss before %s\n' "$pace_seconds" "${hosts[i]}"
@@ -250,7 +358,9 @@ for ((i = 0; i < ${#hosts[@]}; i++)); do
     elif (( i % panes == 0 )); then
         pane_id=$(tmux new-window -d -P -F '#{pane_id}' -t "$session:" -n "$window_name")
     fi
-    pane_command="$(quote "$ROOT/fleet") --run-host $(quote "$host") $(quote "$remote_command") $(quote "$queue_dir") $(quote "$i") $(quote "${#hosts[@]}") $(quote "$pace_seconds")"
+    pane_command=$(shell_quote_args "$ROOT/fleet" --run-host "$host" \
+        "$remote_command" "$queue_dir" "$i" "${#hosts[@]}" \
+        "$pace_seconds" "$linger_seconds" "$panes")
     if (( i > 0 && i % panes != 0 )); then
         pane_id=$(tmux split-window -d -P -F '#{pane_id}' -t "$target" "$pane_command")
         tmux select-layout -t "$target" tiled >/dev/null
@@ -264,6 +374,7 @@ for ((i = 0; i < ${#hosts[@]}; i++)); do
     tmux select-pane -t "$pane_id" -T "$host"
 done
 tmux select-window -t "$session:group-1"
+tmux set-option -t "$session" @fleet_ready 1
 case $mode in
     attach|tui)
         if [[ -n ${TMUX:-} ]]; then
