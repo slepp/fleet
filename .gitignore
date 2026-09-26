@@ -1,2 +1,2 @@
-# Personal host sets stay available to fleet without entering the repository.
-sets/*.local.hosts
+# Host sets are local configuration; publish examples from examples/sets/.
+sets/*.hosts

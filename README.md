@@ -29,8 +29,15 @@ alias per line; blank lines and lines beginning with `#` are ignored. Connection
 users, ports, keys and jump hosts belong in `~/.ssh/config`. Normal SSH host key
 checking still applies.
 
-The included sets are `proxmox`, `k3s-control` and `k3s`. To add a personal set
-without tracking it in Git, create a file such as `sets/lab.local.hosts`:
+Example sets for `proxmox`, `k3s-control` and `k3s` are in `examples/sets/`.
+Copy the ones you need into `sets/` and replace the example hosts with your SSH
+aliases. Files in `sets/` are ignored by Git:
+
+```sh
+cp examples/sets/*.hosts sets/
+```
+
+To add another set, create a file such as `sets/lab.hosts`:
 
 ```text
 # One SSH alias per line
@@ -41,7 +48,7 @@ admin@server3
 
 ```sh
 fleet --list
-fleet --show lab.local
+fleet --show lab
 ```
 
 Keep credentials out of host set files. Review the resolved host list with
@@ -103,7 +110,7 @@ bash tests/run.sh
 ```
 
 The behavioural suite replaces SSH with a local fake and uses an isolated tmux
-server. It never connects to the included hosts. Add tests for changes to
+server. It never connects to your hosts. Add tests for changes to
 command execution, ordering or pane lifetime.
 
 ## Licence
