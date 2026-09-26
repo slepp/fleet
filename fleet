@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+SETS_DIR="$ROOT/sets"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  fleet --list
+  fleet --show SET
+  fleet SET [--serial] [--pace 30s] [--tui | --gui | --detach] [--panes N] 'remote shell command'
+
+Host sets are files named sets/SET.hosts, with one SSH host or alias per line.
+Blank lines and lines beginning with # are ignored. SSH options belong in
+~/.ssh/config. The command is passed to each host's shell as written.
+
+Examples:
+  fleet k3s -- 'sudo apt-get update && sudo apt-get dist-upgrade -y && sync'
+  fleet k3s --serial --pace 30s 'sudo apt-get dist-upgrade -y'
+  fleet k3s --serial --tui --pace 30s 'uptime'
+  fleet --gui routers -- 'show version'
+  fleet --panes 2 --detach proxmox -- 'uptime'
+EOF
+}
+
+die() {
+    printf 'fleet: %s\n' "$*" >&2
+    exit 2
+}
+
+quote() {
+    local value=$1
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+run_host() {
+    local host=$1 command=$2 status
+    printf '\n=== %s ===\n$ %s\n\n' "$host" "$command"
+    ssh -tt -o ConnectTimeout=15 -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 -- "$host" "$command" && status=0 || status=$?
+    if (( status == 0 )); then
+        printf '\n=== %s: OK ===\n' "$host"
+    else
+        printf '\n=== %s: FAILED (exit %d) ===\n' "$host" "$status"
+    fi
+    return "$status"
+}
+
+if [[ ${1:-} == --run-host ]]; then
+    (( $# == 7 )) || die 'internal invocation error'
+    host=$2 remote_command=$3 queue_dir=$4 index=$5 count=$6 pace_seconds=$7
+    status=0
+    if [[ -n $queue_dir && $index -gt 0 ]]; then
+        printf '=== %s: queued ===\n' "$host"
+        until [[ -f $queue_dir/done.$((index - 1)) ]]; do sleep 1; done
+        previous_status=$(< "$queue_dir/done.$((index - 1))")
+        if (( previous_status != 0 )); then
+            printf '=== %s: SKIPPED after earlier failure ===\n' "$host"
+            status=$previous_status
+        else
+            if (( pace_seconds > 0 )); then
+                printf '=== %s: waiting %ss ===\n' "$host" "$pace_seconds"
+                sleep "$pace_seconds"
+            fi
+        fi
+    fi
+    if (( status == 0 )); then
+        run_host "$host" "$remote_command" || status=$?
+    fi
+    if [[ -n $queue_dir ]]; then
+        printf '%s\n' "$status" > "$queue_dir/.done.$index.$$"
+        mv -- "$queue_dir/.done.$index.$$" "$queue_dir/done.$index"
+        if (( index + 1 == count )); then
+            for ((j = 0; j < count; j++)); do rm -f -- "$queue_dir/done.$j"; done
+            rmdir -- "$queue_dir"
+        fi
+    fi
+    exit "$status"
+fi
+
+panes=4
+panes_given=false
+mode=attach
+serial=false
+pace=0
+pace_given=false
+set_name=
+remote_command=
+if (( $# == 0 )); then
+    usage
+    exit 2
+fi
+while (( $# > 0 )); do
+    case $1 in
+        --list)
+            (( $# == 1 )) || die '--list takes no arguments'
+            shopt -s nullglob
+            for file in "$SETS_DIR"/*.hosts; do
+                name=${file##*/}
+                printf '%s\n' "${name%.hosts}"
+            done
+            exit 0
+            ;;
+        --show)
+            (( $# == 2 )) || die 'usage: fleet --show SET'
+            mode=show
+            set_name=$2
+            shift 2
+            break
+            ;;
+        --serial)
+            serial=true
+            shift
+            ;;
+        --pace)
+            (( $# >= 2 )) || die '--pace needs a duration'
+            pace=$2
+            pace_given=true
+            shift 2
+            ;;
+        --panes)
+            (( $# >= 2 )) || die '--panes needs a number'
+            panes=$2
+            panes_given=true
+            shift 2
+            ;;
+        --tui)
+            [[ $mode == attach || $mode == tui ]] || die '--tui, --gui and --detach cannot be combined'
+            mode=tui
+            shift
+            ;;
+        --detach)
+            [[ $mode == attach || $mode == detach ]] || die '--tui, --gui and --detach cannot be combined'
+            mode=detach
+            shift
+            ;;
+        --gui)
+            [[ $mode == attach || $mode == gui ]] || die '--tui, --gui and --detach cannot be combined'
+            mode=gui
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            (( $# == 1 )) || die 'pass the remote command as one quoted argument'
+            remote_command=$1
+            shift
+            break
+            ;;
+        --*) die "unknown option: $1" ;;
+        *)
+            if [[ -z $set_name ]]; then
+                set_name=$1
+                shift
+            else
+                (( $# == 1 )) || die 'pass the remote command as one quoted argument'
+                remote_command=$1
+                shift
+            fi
+            ;;
+    esac
+done
+
+[[ $panes =~ ^[1-9][0-9]*$ ]] || die '--panes must be a positive integer'
+(( panes <= 8 )) || die '--panes must be at most 8 so output stays legible'
+[[ -n $set_name ]] || die 'missing host set'
+[[ $set_name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die 'invalid host set name'
+set_file="$SETS_DIR/$set_name.hosts"
+[[ -f $set_file ]] || die "host set not found: $set_file"
+
+hosts=()
+declare -A seen=()
+line_number=0
+while IFS= read -r line || [[ -n $line ]]; do
+    ((line_number += 1))
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line =~ ^([A-Za-z0-9_.-]+@)?[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || \
+        die "$set_file:$line_number: expected one SSH host or alias"
+    [[ -z ${seen[$line]+yes} ]] || die "$set_file:$line_number: duplicate host: $line"
+    seen[$line]=1
+    hosts+=("$line")
+done < "$set_file"
+(( ${#hosts[@]} > 0 )) || die "host set is empty: $set_file"
+
+if [[ $mode == show ]]; then
+    printf '%s\n' "${hosts[@]}"
+    exit 0
+fi
+
+[[ -n $remote_command ]] || die 'remote command is empty'
+[[ $serial == true || $pace_given == false ]] || die '--pace requires --serial'
+[[ $pace =~ ^([0-9]{1,5})([smh]?)$ ]] || die '--pace must be seconds, minutes or hours (for example 30s)'
+pace_seconds=$((10#${BASH_REMATCH[1]}))
+case ${BASH_REMATCH[2]} in
+    m) pace_seconds=$((pace_seconds * 60)) ;;
+    h) pace_seconds=$((pace_seconds * 3600)) ;;
+esac
+(( pace_seconds <= 86400 )) || die '--pace must be no more than 24 hours'
+command -v ssh >/dev/null || die 'ssh is required'
+if [[ $serial == true && $mode == attach ]]; then
+    [[ $panes_given == false ]] || die '--panes requires --tui, --gui or --detach with --serial'
+    for ((i = 0; i < ${#hosts[@]}; i++)); do
+        if (( i > 0 && pace_seconds > 0 )); then
+            printf '\nWaiting %ss before %s\n' "$pace_seconds" "${hosts[i]}"
+            sleep "$pace_seconds"
+        fi
+        if run_host "${hosts[i]}" "$remote_command"; then
+            continue
+        else
+            status=$?
+            printf 'Stopping after %s failed; remaining hosts were not run.\n' "${hosts[i]}" >&2
+            exit "$status"
+        fi
+    done
+    exit 0
+fi
+command -v tmux >/dev/null || die 'tmux is required'
+if [[ $mode == gui ]]; then
+    [[ -n ${DISPLAY:-} ]] || die '--gui requires an X display'
+    command -v xterm >/dev/null || die '--gui requires xterm'
+fi
+if [[ $mode == attach || $mode == tui ]] && [[ ! -t 0 ]]; then
+    die 'attaching requires a terminal; use --detach or --gui'
+fi
+
+session="fleet-${set_name}-$(date +%Y%m%d-%H%M%S)-$$"
+queue_dir=
+printf 'Starting %d hosts in tmux session %s\n' "${#hosts[@]}" "$session"
+for ((i = 0; i < ${#hosts[@]}; i++)); do
+    host=${hosts[i]}
+    window_number=$((i / panes + 1))
+    window_name="group-$window_number"
+    target="$session:$window_name"
+    if (( i == 0 )); then
+        pane_id=$(tmux new-session -d -P -F '#{pane_id}' -s "$session" -n "$window_name")
+        if [[ $serial == true ]]; then
+            if ! queue_dir=$(mktemp -d "${TMPDIR:-/tmp}/fleet-serial.XXXXXXXX"); then
+                tmux kill-session -t "$session" || true
+                die 'could not create serial state directory'
+            fi
+        fi
+        printf 'Reattach later: tmux attach-session -t %s\n' "$session"
+    elif (( i % panes == 0 )); then
+        pane_id=$(tmux new-window -d -P -F '#{pane_id}' -t "$session:" -n "$window_name")
+    fi
+    pane_command="$(quote "$ROOT/fleet") --run-host $(quote "$host") $(quote "$remote_command") $(quote "$queue_dir") $(quote "$i") $(quote "${#hosts[@]}") $(quote "$pace_seconds")"
+    if (( i > 0 && i % panes != 0 )); then
+        pane_id=$(tmux split-window -d -P -F '#{pane_id}' -t "$target" "$pane_command")
+        tmux select-layout -t "$target" tiled >/dev/null
+    fi
+    if (( i % panes == 0 )); then
+        tmux set-option -w -t "$target" remain-on-exit on
+        tmux set-option -w -t "$target" pane-border-status top
+        tmux set-option -w -t "$target" pane-border-format '#{pane_title}'
+        tmux respawn-pane -k -t "$pane_id" "$pane_command"
+    fi
+    tmux select-pane -t "$pane_id" -T "$host"
+done
+tmux select-window -t "$session:group-1"
+case $mode in
+    attach|tui)
+        if [[ -n ${TMUX:-} ]]; then
+            tmux switch-client -t "$session"
+        else
+            tmux attach-session -t "$session"
+        fi
+        ;;
+    gui)
+        env -u TMUX xterm -T "fleet: $set_name" -geometry 160x48 \
+            -e tmux attach-session -t "$session" </dev/null >/dev/null 2>&1 &
+        ;;
+esac
