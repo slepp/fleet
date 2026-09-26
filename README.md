@@ -1,83 +1,111 @@
-# Fleet command view
+# fleet
 
-Run one shell command on a named set of SSH hosts. Parallel runs show each
-host in a separate live tmux pane; serial runs use the invoking terminal by
-default.
-It works with servers and SSH-capable routers; the remote hosts do not need
-Ansible or Python. The local machine needs Bash and OpenSSH. Parallel runs
-and visual serial runs also need tmux. `--gui` also needs X and xterm.
+Run one command across a named set of SSH hosts. Parallel runs show live output
+in labelled tmux panes. Serial runs use the invoking terminal by default. The
+remote hosts need SSH access, not Ansible or Python.
 
-From this checkout, link the launcher from a directory on `PATH` to call it
-as `fleet`:
+## Requirements
+
+The launcher runs on Linux with Bash 4 or newer, GNU coreutils and OpenSSH.
+Parallel runs and visual serial runs also need tmux. `--gui` needs X and xterm.
+The tmux view has been tested with tmux 3.6.
+
+## Install
+
+From this checkout, link the executable from a directory on `PATH`:
 
 ```sh
 mkdir -p ~/.local/bin
 ln -s "$(pwd)/fleet" ~/.local/bin/fleet
 ```
 
-The launcher resolves its path to find the host sets in this repository.
+The launcher follows the link to find its host sets. Ensure `~/.local/bin` is
+on your `PATH`, or run `./fleet` from this directory.
 
-Create a host set at `sets/servers.hosts`:
+## Host sets
+
+Each file in `sets/` named `SET.hosts` defines one set. Put one SSH hostname or
+alias per line; blank lines and lines beginning with `#` are ignored. Connection
+users, ports, keys and jump hosts belong in `~/.ssh/config`. Normal SSH host key
+checking still applies.
+
+The included sets are `proxmox`, `k3s-control` and `k3s`. To add a personal set
+without tracking it in Git, create a file such as `sets/lab.local.hosts`:
 
 ```text
-# SSH hostnames or aliases, one per line
+# One SSH alias per line
 server1
 server2
 admin@server3
 ```
 
-Included sets are `proxmox`, `k3s-control` and `k3s`.
-The host lists contain the SSH names provided for this fleet; review them
-with `fleet --show SET` before running a command.
-
-Then run:
-
 ```sh
 fleet --list
-fleet --show proxmox
-fleet k3s-control -- 'sudo apt-get update && sudo apt-get dist-upgrade -y && sync'
-fleet k3s --serial --pace 30s 'sudo apt-get dist-upgrade -y'
-fleet k3s --serial --tui --pace 30s 'uptime'
-fleet k3s --linger 30s -- 'uptime'
-fleet k3s --linger forever -- 'uptime'
-fleet --panes 2 proxmox -- 'pveversion'
-fleet --gui k3s -- 'uptime'
+fleet --show lab.local
 ```
 
-The quoted command runs through each remote account's shell. Quote it once
-locally to preserve pipes, redirects and `&&`. Use `sudo` in the command where
-needed; SSH allocates a terminal so prompts can appear in the active console
-or pane. Keep SSH users, ports, keys and jump hosts in `~/.ssh/config`, then
-put those aliases in the host sets. Parallel mode starts all hosts at once
-and groups up to four panes in each tmux window by default; `--panes N`
-changes the layout, with up to eight panes per window. Completed panes remain
-for 10 seconds, then close;
-running panes from later windows move into the freed space. Use `--linger 30s`
-for a different delay, `--linger 0s` to close immediately, or
-`--linger forever` to retain completed panes until you close the session.
-A zoomed window keeps its layout until you unzoom it; the next pane retirement
-can then fill its gaps.
+Keep credentials out of host set files. Review the resolved host list with
+`--show` before a maintenance command.
 
-`--serial` runs hosts in list order in the current terminal and stops on the
-first failure. `--pace 30s` waits 30 seconds after one host finishes before
-starting the next; `m` and `h` are also accepted. The command's exit status
-is the first failed host's status, or zero if all succeed. Add `--tui` for
-the tiled tmux view, `--gui` for that view in xterm, or `--detach` to leave
-it in a tmux session. `--panes N` and `--linger` apply only to a visual run.
-In a visual serial run, a pane closed before it finishes does not release
-the next host.
-Serial mode waits for the SSH command to finish; keep work in the foreground
-if later hosts must wait for it.
+## Run commands
 
-Tmux controls: `Ctrl-b n` moves to the next window, `Ctrl-b z` zooms a pane,
-and `Ctrl-b d` detaches without stopping the commands. The launcher prints a
-reattach command. `--detach` starts a session without opening it. Running
-`--gui` opens an xterm window containing the same tiled tmux view. When the
-work is done, press `Ctrl-b :`, type `kill-session`, and press Enter to close
-the whole session. Closing the xterm window only detaches it.
+Pass the remote shell command as one quoted argument. `--` separates it from
+launcher options and preserves shell operators such as `&&`, pipes and
+redirections:
 
-For visual runs, the launcher's exit status reports whether it created the
-view. Check completed panes during the linger period for remote command
-results. With a finite linger, the session closes after its last pane retires.
-Closing a pane or killing the tmux session may interrupt a running SSH
-command; a remote command could continue after the connection ends.
+```sh
+fleet k3s-control -- 'sudo apt-get update && sudo apt-get dist-upgrade -y && sync'
+fleet proxmox -- 'pveversion'
+```
+
+Parallel mode starts all hosts at once, with four panes per tmux window by
+default. `--panes N` sets one to eight panes per window. Completed panes close
+after 10 seconds; running panes from later windows move into the available
+space. Change the delay with `--linger 0s`, `--linger 30s` or
+`--linger forever`. A zoomed window keeps its layout until it is unzoomed; a
+later pane retirement can then fill its gaps.
+
+Serial mode runs hosts in the order listed in the set and stops on the first
+failure. `--pace` waits after one host finishes before starting the next. The
+command exits with the failed host's status, or zero if all hosts succeed:
+
+```sh
+fleet k3s --serial --pace 30s 'sudo apt-get dist-upgrade -y'
+```
+
+Serial mode uses the console unless `--tui`, `--gui` or `--detach` requests a
+tmux view. `--panes` and `--linger` apply to visual runs. Keep remote work in
+the foreground if later hosts must wait for it. SSH allocates a terminal so
+password and sudo prompts can appear in the active console or pane.
+
+## Tmux controls
+
+`Ctrl-b n` moves to the next window, `Ctrl-b z` zooms a pane, and `Ctrl-b d`
+detaches without stopping work. The launcher prints a reattach command.
+`--gui` opens the same tiled view in an xterm window. Closing xterm only
+detaches it.
+
+With a finite linger, the tmux session closes after the last pane retires.
+With `--linger forever`, press `Ctrl-b :`, type `kill-session`, and press Enter
+to close it. A visual run's launcher exit status reports whether the view was
+created; inspect individual panes for remote command results before they
+close. Killing a pane or session during a command can interrupt SSH while
+remote work continues.
+
+## Tests and contributions
+
+Run these checks before submitting a change:
+
+```sh
+bash -n fleet tests/run.sh
+shellcheck fleet tests/run.sh
+bash tests/run.sh
+```
+
+The behavioural suite replaces SSH with a local fake and uses an isolated tmux
+server. It never connects to the included hosts. Add tests for changes to
+command execution, ordering or pane lifetime.
+
+## Licence
+
+MIT © 2026 Stephen Olesen. See [LICENSE](LICENSE).

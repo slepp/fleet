@@ -1,0 +1,2 @@
+# Personal host sets stay available to fleet without entering the repository.
+sets/*.local.hosts
